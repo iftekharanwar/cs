@@ -4,7 +4,7 @@ cs — Claude Sessions. Browse and search your Claude Code history.
 
 Usage:
   cs                    list sessions from the last 7 days
-  cs -i                 interactive picker (fzf) — type to filter, enter resumes
+  cs -i [query]         interactive picker (fzf) — type to filter, enter resumes
   cs -d 30              last 30 days
   cs -a                 all time
   cs <query>            full-text search your prompts, newest first

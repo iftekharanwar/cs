@@ -56,11 +56,18 @@ Tuesday 28 July
 Reopening something from last week:
 
 ```sh
-cs -i          # type to filter, Enter resumes
+cs -i            # type to filter, Enter resumes
+cs -i webhook    # or start with the filter already applied
 ```
 
 Enter changes into the session's own project directory before resuming, so
 relative paths and `CLAUDE.md` resolve against the right tree.
+
+Reopening a long-running session is where old conversations get expensive.
+Claude Code will offer to resume from a summary rather than replay the whole
+history; on a session of a few hundred thousand tokens that is usually the
+right answer, since the full transcript counts against your usage window.
+Use `cs -v` instead when you only need to read what was decided.
 
 When you want to see the matches before committing to one:
 
