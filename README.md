@@ -25,7 +25,7 @@ Requires Python 3 (stdlib only) and Claude Code. `fzf` is optional and only
 needed for `cs -i`.
 
 ```sh
-git clone https://github.com/<you>/cs.git
+git clone https://github.com/iftekharanwar/cs.git
 cd cs
 ./install.sh                  # symlinks into ~/.local/bin
 ./install.sh /usr/local/bin   # or a directory of your choice
