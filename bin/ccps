@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""
+ccps — list the Claude Code sessions running right now.
+
+Reads the live-process registry under ~/.claude/sessions, filters to PIDs that
+are actually alive, and shows each session's name, status, cwd and last prompt.
+"""
+import json, glob, os, re, sys, time
+
+HOME = os.path.expanduser("~")
+rows = []
+for f in glob.glob(f"{HOME}/.claude/sessions/*.json"):
+    try:
+        rows.append(json.load(open(f)))
+    except Exception:
+        pass
+if not rows:
+    print("\033[2m  no Claude sessions running\033[0m"); raise SystemExit
+
+def alive(pid):
+    try: os.kill(int(pid), 0); return True
+    except Exception: return False
+
+rows = [r for r in rows if alive(r.get("pid", -1))]
+
+def find_transcript(sid):
+    for p in glob.glob(f"{HOME}/.claude/projects/*/{sid}.jsonl"):
+        return p
+    return None
+
+def last_prompt(sid):
+    """What is this session actually working on? The most recent thing you
+    typed beats an ai-title, which lags and summarises the whole chat."""
+    p = find_transcript(sid)
+    if not p:
+        return ""
+    best = ""
+    try:
+        size = os.path.getsize(p)
+        with open(p, "rb") as fh:
+            if size > 300_000:
+                fh.seek(size - 300_000); fh.readline()
+            blob = fh.read().decode("utf-8", "replace")
+        for line in blob.splitlines():
+            if '"last-prompt"' in line:
+                try: d = json.loads(line)
+                except Exception: continue
+                if d.get("type") == "last-prompt" and d.get("lastPrompt"):
+                    best = d["lastPrompt"]
+    except Exception:
+        pass
+    best = re.sub(r"<[^>]{1,40}>", "", best or "").replace("\n", " ").strip()
+    best = re.sub(r"\s+", " ", best)
+    return best
+
+W = 60
+print()
+print("\033[1m\033[38;5;179m  live claude sessions\033[0m  \033[2m(ccps)\033[0m")
+print("\033[2m  " + "─" * (W + 34) + "\033[0m")
+for d in sorted(rows, key=lambda r: (r.get("status") != "busy", -(r.get("updatedAt") or 0))):
+    st = d.get("status", "?")
+    dot = "\033[38;5;173m●" if st == "busy" else "\033[38;5;108m○"
+    cwd = (d.get("cwd") or "").replace(HOME, "~")
+    name = d.get("name") or "(unnamed)"
+    derived = d.get("nameSource") == "derived"
+    age = ""
+    if d.get("startedAt"):
+        m = int((time.time() * 1000 - d["startedAt"]) / 60000)
+        age = f"{m}m" if m < 90 else f"{m//60}h"
+    nm = f"\033[2m{name}\033[0m" if derived else f"\033[1m{name}\033[0m"
+    pad = " " * max(0, 20 - len(name))
+    print(f"  {dot} \033[0m{nm}{pad} \033[2m{st:<5}{age:>4}\033[0m  \033[38;5;109m{cwd}\033[0m")
+    task = last_prompt(d.get("sessionId", ""))
+    if task:
+        print(f"      \033[2m↳ {task[:W]}\033[0m")
+print()
+un = [r for r in rows if r.get("nameSource") == "derived"]
+if un:
+    print(f"\033[2m  {len(un)} auto-named (dim above). Rename inside them with /rename\033[0m\n")

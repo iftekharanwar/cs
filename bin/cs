@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+cs — Claude Sessions. Browse and search your Claude Code history.
+
+Usage:
+  cs                    list sessions from the last 7 days
+  cs -i                 interactive picker (fzf) — type to filter, enter resumes
+  cs -d 30              last 30 days
+  cs -a                 all time
+  cs <query>            full-text search your prompts, newest first
+  cs -g <query>         deep grep inside full transcripts (slow, searches replies too)
+  cs -p <name>          filter to projects whose path matches <name>
+  cs -v <id|index>      view a session's conversation
+  cs -r <id|index>      resume a session (runs: claude --resume <id>)
+
+Searching (a query, -g, -p, -i, -v or -r) covers all time. A bare `cs` shows
+the last 7 days; -d N or -a widen it.
+
+Data sources (read-only):
+  ~/.claude/history.jsonl        every prompt you've typed, with sessionId+project+ts
+  ~/.claude/projects/**/*.jsonl  full transcripts; provides the ai-title
+"""
+
+import json, os, sys, subprocess, time, re, argparse, shutil
+from pathlib import Path
+
+HOME = Path.home()
+HIST = HOME / ".claude" / "history.jsonl"
+PROJ = HOME / ".claude" / "projects"
+
+# ---------- colors ----------
+T = sys.stdout.isatty()
+def c(s, code): return f"\033[{code}m{s}\033[0m" if T else s
+DIM    = lambda s: c(s, "2")
+BOLD   = lambda s: c(s, "1")
+# muted palette, matched to the statusline so the two read as one system
+CYAN   = lambda s: c(s, "38;5;109")
+YELLOW = lambda s: c(s, "38;5;179")
+GREEN  = lambda s: c(s, "38;5;108")
+MAGENTA= lambda s: c(s, "38;5;139")
+ORANGE = lambda s: c(s, "38;5;173")
+
+
+def load_history():
+    """Read history.jsonl -> list of prompt records."""
+    if not HIST.exists():
+        sys.exit(f"{HIST} not found — is Claude Code installed, and have you "
+                 "run it at least once?")
+    out = []
+    with HIST.open(errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not d.get("sessionId"):
+                continue
+            out.append(d)
+    if not out:
+        sys.exit(f"{HIST} has no usable entries. Claude Code may have changed "
+                 "its history format; see the compatibility note in the README.")
+    return out
+
+
+_title_cache = {}
+
+_file_index = None
+
+def build_index():
+    """Map sessionId -> path. Depth-2 glob only: nested dirs hold subagent
+    transcripts, which must never appear as resumable sessions."""
+    global _file_index
+    if _file_index is not None:
+        return _file_index
+    _file_index = {}
+    if PROJ.exists():
+        for pdir in PROJ.iterdir():
+            if not pdir.is_dir():
+                continue
+            for f in pdir.glob("*.jsonl"):
+                _file_index[f.stem] = f
+    return _file_index
+
+
+def find_session_file(sid):
+    return build_index().get(sid)
+
+
+def ai_title(sid):
+    """Last ai-title line in the transcript, if Claude Code generated one."""
+    if sid in _title_cache:
+        return _title_cache[sid]
+    f = find_session_file(sid)
+    title = None
+    if f:
+        # ai-title lines repeat throughout the file and can drift on resume,
+        # so we want the LAST one. Files reach 76MB, so scan the tail only:
+        # read the final chunk and pick the last match in it.
+        try:
+            size = f.stat().st_size
+            with f.open("rb") as fh:
+                if size > 400_000:
+                    fh.seek(size - 400_000)
+                    fh.readline()          # discard partial line
+                blob = fh.read().decode("utf-8", "replace")
+            for line in blob.splitlines():
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") == "ai-title" and d.get("aiTitle"):
+                    title = d["aiTitle"]
+            if title is None:
+                # no ai-title (older/short sessions): fall back to last-prompt
+                for line in blob.splitlines():
+                    if '"last-prompt"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") == "last-prompt" and d.get("lastPrompt"):
+                        lp = clean(d["lastPrompt"])
+                        if lp and not JUNK.match(lp):
+                            title = lp
+            if title is None and size > 400_000:
+                # rare: no ai-title in the tail, fall back to a full scan
+                with f.open(errors="replace") as fh:
+                    for line in fh:
+                        if '"ai-title"' not in line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        if d.get("type") == "ai-title" and d.get("aiTitle"):
+                            title = d["aiTitle"]
+        except Exception:
+            pass
+    _title_cache[sid] = title
+    return title
+
+
+JUNK = re.compile(r"^\s*(\[Pasted text.*|/[a-z][\w-]*|<command-name>.*)\s*$", re.I)
+
+def clean(s):
+    s = (s or "").replace("\n", " ").strip()
+    s = re.sub(r"<[^>]{1,40}>", "", s)      # strip stray tags
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def group_sessions(records, since_ms=None, proj_filter=None):
+    """Collapse prompt records into one entry per session."""
+    S = {}
+    for d in records:
+        ts = d.get("timestamp") or 0
+        if since_ms and ts < since_ms:
+            continue
+        p = d.get("project") or ""
+        if proj_filter and proj_filter.lower() not in p.lower():
+            continue
+        sid = d["sessionId"]
+        e = S.setdefault(sid, {
+            "sid": sid, "project": p, "first": ts, "last": ts,
+            "n": 0, "prompts": [], "firstmsg": None, "cmd": None,
+        })
+        e["n"] += 1
+        e["first"] = min(e["first"], ts)
+        e["last"] = max(e["last"], ts)
+        disp = clean(d.get("display"))
+        e["prompts"].append((ts, disp))
+        if disp and e["firstmsg"] is None and not JUNK.match(disp):
+            e["firstmsg"] = disp
+        # slash-command-only sessions (e.g. /eod) have no ai-title and no prose;
+        # naming the command beats showing "(no title)"
+        if disp and e["cmd"] is None and re.fullmatch(r"/[a-z][\w-]*", disp):
+            e["cmd"] = disp
+    return sorted(S.values(), key=lambda e: e["last"], reverse=True)
+
+
+def label(e, want_title=True, width=72):
+    t = ai_title(e["sid"]) if want_title else None
+    s = t or e["firstmsg"]
+    if not s:
+        s = f"{e['cmd']} run" if e.get("cmd") else "(no title)"
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def fmt_time(ms):
+    return time.strftime("%a %d %b %H:%M", time.localtime(ms / 1000))
+
+
+def short_proj(p):
+    p = p.replace(str(HOME), "~")
+    return p
+
+
+GAP_MS = 4 * 3600 * 1000   # a >4h silence means you walked away; new sitting
+
+def sittings(e):
+    """Split one session's prompts into conversation bursts.
+
+    Sessions get resumed, so a single file can span days. Showing that as one
+    row hides when you actually worked. Returns [(start, end, count)] newest
+    first.
+    """
+    ts = sorted(t for t, _ in e["prompts"])
+    if not ts:
+        return []
+    out, s, prev, n = [], ts[0], ts[0], 1
+    for t in ts[1:]:
+        if t - prev > GAP_MS:
+            out.append((s, prev, n)); s, n = t, 0
+        prev = t; n += 1
+    out.append((s, prev, n))
+    return list(reversed(out))
+
+
+def print_list(entries, show_index=True):
+    if not entries:
+        print(DIM("no sessions found"))
+        return
+    # group by day
+    last_day = None
+    idx = 0
+    for e in entries:
+        idx += 1
+        day = time.strftime("%A %d %B", time.localtime(e["last"] / 1000))
+        if day != last_day:
+            print()
+            print(BOLD(YELLOW(day)))
+            last_day = day
+        num = f"{idx:>3}." if show_index else "   "
+        sits = sittings(e)
+        span = DIM(f"  ({len(sits)} sittings)") if len(sits) > 1 else ""
+        # weight bar: how big the session is, so heavy ones are obvious
+        n = e["n"]
+        w = min(5, max(1, int(n ** 0.5 / 2.2)))
+        bar = "▪" * w
+        wcol = GREEN if n < 15 else (ORANGE if n < 60 else MAGENTA)
+        print(f"{DIM(num)} {CYAN(e['sid'][:8])} "
+              f"{DIM(time.strftime('%H:%M', time.localtime(e['last']/1000)))} "
+              f"{wcol(bar)}{' ' * (5 - w)} {DIM(f'{n:>3}msg')}  {label(e)}{span}")
+        print(f"      {DIM(short_proj(e['project']))}")
+    print()
+    print(DIM(f"{len(entries)} sessions   ·   cs -v <n> to view   ·   cs -r <n> to resume"))
+
+
+def cmd_search(entries, query):
+    q = query.lower()
+    hits = []
+    for e in entries:
+        for ts, p in e["prompts"]:
+            if q in p.lower():
+                hits.append((ts, e, p))
+    hits.sort(key=lambda x: x[0], reverse=True)
+    if not hits:
+        print(DIM(f'no prompt matches for "{query}"'))
+        return []
+    seen = {}
+    print()
+    print(BOLD(f'{len(hits)} matching prompts for "{query}"'))
+    print()
+    order = []
+    for ts, e, p in hits:
+        if e["sid"] not in seen:
+            seen[e["sid"]] = len(order) + 1
+            order.append(e)
+        n = seen[e["sid"]]
+        hl = re.sub(f"({re.escape(query)})", lambda m: c(m.group(1), "1;32"), p, flags=re.I)
+        if not e.get("_shown"):
+            e["_shown"] = True
+            print()
+            print(f"{DIM(f'{n:>3}.')} {CYAN(e['sid'][:8])} {MAGENTA(label(e))}")
+            print(f"     {DIM(short_proj(e['project']))}")
+        print(f"     {DIM('›')} {DIM(fmt_time(ts))}  {hl[:130]}")
+    print()
+    print(DIM(f"{len(order)} sessions   ·   cs -v <n> / cs -r <n>"))
+    return order
+
+
+def iter_messages(f):
+    """Yield (role, text) for real conversation turns only.
+
+    Raw `rg` over the JSONL is useless: every transcript embeds the system
+    prompt (skill lists, tool docs), so unrelated sessions match on boilerplate.
+    We decode each line and keep only user/assistant text blocks.
+    """
+    with f.open(errors="replace") as fh:
+        for line in fh:
+            if len(line) < 20:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
+                continue
+            m = d.get("message") or {}
+            content = m.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            else:
+                continue
+            text = clean(text)
+            if not text or text.startswith("<system-reminder"):
+                continue
+            # drop the injected context blob that prefixes some first messages
+            if "Codebase and user instructions are shown below" in text:
+                continue
+            yield d.get("type"), text
+
+
+def cmd_grep(entries, query):
+    """Deep search inside full transcripts (assistant replies too)."""
+    files = []
+    for e in entries:
+        f = find_session_file(e["sid"])
+        if f:
+            files.append((f, e))
+    if not files:
+        print(DIM("no transcripts"))
+        return []
+    print(DIM(f"deep-searching {len(files)} transcripts..."), file=sys.stderr)
+    q = query.lower()
+    order = []
+    for f, e in files:
+        hits = []
+        for role, text in iter_messages(f):
+            if q in text.lower():
+                hits.append((role, text))
+        if not hits:
+            continue
+        order.append(e)
+        print()
+        print(f"{DIM(f'{len(order):>3}.')} {CYAN(e['sid'][:8])} {MAGENTA(label(e))} "
+              f"{GREEN(f'({len(hits)} hits)')}")
+        print(f"     {DIM(short_proj(e['project']))}  {DIM(fmt_time(e['last']))}")
+        for role, text in hits[:3]:
+            i = text.lower().index(q)
+            s = max(0, i - 60)
+            snip = ("…" if s else "") + text[s:i + len(query) + 70]
+            snip = re.sub(f"({re.escape(query)})",
+                          lambda m: c(m.group(1), "1;32"), snip, flags=re.I)
+            who = GREEN("you") if role == "user" else MAGENTA("claude")
+            print(f"     {DIM('›')} {who} {snip}")
+        if len(hits) > 3:
+            print(f"     {DIM(f'… +{len(hits)-3} more')}")
+    if not order:
+        print(DIM(f'no transcript matches for "{query}"'))
+    else:
+        print()
+        print(DIM(f"{len(order)} sessions   ·   cs -v <n> / cs -r <n>"))
+    return order
+
+
+def resolve(entries, ref):
+    """Accept an index (1-based) or a session-id prefix."""
+    if ref.isdigit():
+        i = int(ref) - 1
+        if 0 <= i < len(entries):
+            return entries[i]
+        sys.exit(f"index {ref} out of range (1-{len(entries)})")
+    for e in entries:
+        if e["sid"].startswith(ref):
+            return e
+    sys.exit(f"no session matching '{ref}' — check the id with `cs -a`, or "
+             "drop any -d/-p filter that may be excluding it")
+
+
+def cmd_view(e):
+    f = find_session_file(e["sid"])
+    if not f:
+        sys.exit("transcript not found")
+    print()
+    print(BOLD(label(e)))
+    print(DIM(f"{e['sid']}   {short_proj(e['project'])}   {fmt_time(e['first'])}"))
+    print()
+    with f.open(errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("isSidechain"):
+                continue
+            t = d.get("type")
+            if t not in ("user", "assistant"):
+                continue
+            m = d.get("message") or {}
+            content = m.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            text = clean(text)
+            if not text or text.startswith("<system-reminder"):
+                continue
+            who = GREEN("you") if t == "user" else MAGENTA("claude")
+            print(f"{who}  {text[:600]}")
+            print()
+
+
+def cmd_resume(e):
+    print(DIM(f"resuming {e['sid']}  ({label(e)})"))
+    print(DIM(f"cwd: {short_proj(e['project'])}"))
+    # resume from the session's own directory, else project-relative paths
+    # and CLAUDE.md context resolve against the wrong tree
+    if not shutil.which("claude"):
+        sys.exit("`claude` is not on PATH — install Claude Code, or use "
+                 f"`cs -v {e['sid'][:8]}` to read the session instead.")
+    if os.path.isdir(e["project"]):
+        os.chdir(e["project"])
+    else:
+        print(DIM("project directory is gone; resuming from the current one"))
+    os.execvp("claude", ["claude", "--resume", e["sid"]])
+
+
+def cmd_pick(entries):
+    """Interactive fzf picker: type to filter, Enter resumes."""
+    if not entries:
+        print(DIM("no sessions"))
+        return
+    if not shutil.which("fzf"):
+        sys.exit("fzf not installed — brew install fzf  (or use: cs -r <n>)")
+    lines = []
+    for e in entries:
+        day = time.strftime("%a %d %b %H:%M", time.localtime(e["last"] / 1000))
+        lines.append("\t".join([
+            e["sid"], day, short_proj(e["project"]),
+            f"{e['n']}msg", label(e, width=200),
+        ]))
+    r = subprocess.run(
+        ["fzf", "--ansi", "--with-nth", "2..", "--delimiter", "\t",
+         "--prompt", "session ❯ ", "--height", "90%", "--reverse",
+         "--preview", f"{sys.argv[0]} -v {{1}} 2>/dev/null | head -200",
+         "--preview-window", "right:55%:wrap",
+         "--header", "enter=resume  ctrl-v=preview scroll  esc=quit",
+         "--bind", "ctrl-v:preview-page-down"],
+        input="\n".join(lines), capture_output=True, text=True)
+    sel = r.stdout.strip()
+    if not sel:
+        return
+    sid = sel.split("\t")[0]
+    for e in entries:
+        if e["sid"] == sid:
+            return cmd_resume(e)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("query", nargs="*")
+    ap.add_argument("-d", "--days", type=float, default=7)
+    ap.add_argument("-a", "--all", action="store_true")
+    ap.add_argument("-p", "--project")
+    ap.add_argument("-g", "--grep", action="store_true")
+    ap.add_argument("-i", "--interactive", action="store_true")
+    ap.add_argument("-v", "--view")
+    ap.add_argument("-r", "--resume")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+
+    if a.help:
+        print(__doc__)
+        return
+
+    # -v / -r may reference an index from a fresh list or a search
+    q = " ".join(a.query).strip()
+
+    # The 7-day window is for browsing. Anything that names a target — a query,
+    # a project, an id, or the picker — must see all of history, or it reports
+    # "not found" for work that is simply older than a week. -v also backs the
+    # fzf preview, so a hidden id blanks the preview pane instead of erroring.
+    searching = (bool(q) or a.grep or bool(a.project) or a.interactive
+                 or bool(a.view) or bool(a.resume))
+    explicit_days = any(x in sys.argv for x in ("-d", "--days"))
+    if searching and not explicit_days:
+        a.all = True
+
+    since = None if a.all else int((time.time() - a.days * 86400) * 1000)
+    recs = load_history()
+    entries = group_sessions(recs, since, a.project)
+
+    if a.view or a.resume:
+        ref = a.view or a.resume
+        # if a query is present, resolve against those results
+        pool = entries
+        if q:
+            pool = [e for e in entries if any(q.lower() in p.lower() for _, p in e["prompts"])]
+        e = resolve(pool, ref)
+        return cmd_view(e) if a.view else cmd_resume(e)
+
+    if a.interactive:
+        if q:
+            entries = [e for e in entries
+                       if any(q.lower() in p.lower() for _, p in e["prompts"])
+                       or q.lower() in (label(e) or "").lower()]
+        return cmd_pick(entries)
+
+    if q:
+        if a.grep:
+            cmd_grep(entries, q)
+        else:
+            res = cmd_search(entries, q)
+            if not res:
+                print(DIM("tip: cs -g " + q + "  searches full transcripts"))
+    else:
+        print_list(entries)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        pass
