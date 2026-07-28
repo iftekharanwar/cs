@@ -15,6 +15,7 @@ cs -g <query>         search inside full transcripts, replies included
 cs -p <name>          everything under a matching project path
 cs -v <id|index>      read a session without reopening it
 cs -r <id|index>      resume a session
+cs --doctor           check the on-disk formats still match
 ccps                  sessions running right now
 ```
 
@@ -103,10 +104,32 @@ cs -d 3 auth   # scope a search deliberately
 Nothing is written, sent anywhere, or cached outside those files. Resuming
 shells out to `claude --resume <id>`.
 
-Both formats are internal to Claude Code and can change without notice. If an
-update breaks parsing, `cs` reports what it could not read rather than failing
-silently. [claude-history](https://github.com/raine/claude-history) is a
-maintained alternative if you need something with a stability guarantee.
+Both formats are internal to Claude Code and can change without notice. When
+something looks wrong — empty listings, missing titles, sessions that will not
+resume — check the assumptions before debugging further:
+
+```sh
+cs --doctor
+```
+
+It verifies each field the parser depends on against your actual files and
+names the ones that have gone missing, exiting non-zero if anything is broken.
+
+`cs` is deliberately small. [claude-history](https://github.com/raine/claude-history)
+is a larger, actively maintained Rust tool covering the same ground with
+semantic search, renaming, forking and export. It does not group resumed
+sessions into one entry, and it does not show which sessions are running now,
+which is what `cs` and `ccps` add.
+
+## Tests
+
+```sh
+python3 test_cs.py
+```
+
+The suite builds throwaway `~/.claude` trees rather than reading real history,
+so it runs anywhere. It covers the parsing of both file formats, the rule that
+searching ignores the 7-day browse window, and `--doctor` itself.
 
 Subagent transcripts live in nested directories under `projects/`. They are
 deliberately excluded, since they are not resumable sessions.

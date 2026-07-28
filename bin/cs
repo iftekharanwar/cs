@@ -12,6 +12,7 @@ Usage:
   cs -p <name>          filter to projects whose path matches <name>
   cs -v <id|index>      view a session's conversation
   cs -r <id|index>      resume a session (runs: claude --resume <id>)
+  cs --doctor           check that Claude Code's on-disk formats still parse
 
 Searching (a query, -g, -p, -i, -v or -r) covers all time. A bare `cs` shows
 the last 7 days; -d N or -a widen it.
@@ -462,6 +463,124 @@ def cmd_pick(entries):
             return cmd_resume(e)
 
 
+def cmd_doctor():
+    """Check that the on-disk formats still match what the parser expects.
+
+    Claude Code owns these files and can change them at any time. Rather than
+    let a schema change show up as empty results, check each field this tool
+    depends on and report which ones have gone missing.
+    """
+    ok, warn, bad = [], [], []
+
+    if not HIST.exists():
+        bad.append(f"{HIST} is missing")
+    elif HIST.stat().st_size == 0:
+        bad.append(f"{HIST} is empty")
+    else:
+        ok.append(f"history file present ({HIST.stat().st_size // 1024} KB)")
+
+    recs, unparsed = [], 0
+    if HIST.exists():
+        with HIST.open(errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    unparsed += 1
+    if unparsed:
+        warn.append(f"{unparsed} history lines are not valid JSON")
+
+    if recs:
+        ok.append(f"{len(recs)} history records parsed")
+        # These three drive listing, grouping and resuming. Without them the
+        # tool has nothing to show, so treat any absence as fatal.
+        for field, why in (("sessionId", "grouping and resume"),
+                           ("timestamp", "date ordering"),
+                           ("project",   "project paths")):
+            n = sum(1 for r in recs if r.get(field))
+            if n == 0:
+                bad.append(f"no record has '{field}' — needed for {why}")
+            elif n < len(recs) * 0.9:
+                warn.append(f"only {n}/{len(recs)} records have '{field}'")
+            else:
+                ok.append(f"'{field}' present on {n}/{len(recs)} records")
+        # Prompt text is stored under 'display'; searching depends on it.
+        n = sum(1 for r in recs if r.get("display"))
+        (ok if n else bad).append(
+            f"'display' (prompt text) on {n}/{len(recs)} records"
+            if n else "no record has 'display' — prompt search will find nothing")
+    elif HIST.exists():
+        bad.append("history file has no usable records")
+
+    if not PROJ.is_dir():
+        bad.append(f"{PROJ} is missing — titles and -g search unavailable")
+    else:
+        files = list(PROJ.glob("*/*.jsonl"))
+        if not files:
+            bad.append(f"no transcripts found under {PROJ}")
+        else:
+            ok.append(f"{len(files)} transcripts found")
+            # Sample the newest few: titles come from 'ai-title' lines and
+            # -g search needs user/assistant message records.
+            sample = sorted(files, key=lambda p: p.stat().st_mtime,
+                            reverse=True)[:20]
+            titled = sum(1 for f in sample
+                         if any('"ai-title"' in ln for ln in _tail_lines(f)))
+            if titled == 0:
+                warn.append("no 'ai-title' lines in the 20 newest transcripts; "
+                            "listings will fall back to the last prompt")
+            else:
+                ok.append(f"'ai-title' found in {titled}/{len(sample)} recent transcripts")
+
+            roles = 0
+            for f in sample[:5]:
+                for role, _ in iter_messages(f):
+                    if role in ("user", "assistant"):
+                        roles += 1
+                        break
+            if roles == 0:
+                bad.append("no user/assistant messages readable — '-g' search "
+                           "and '-v' will show nothing")
+            else:
+                ok.append("transcript messages readable")
+
+    if not shutil.which("claude"):
+        warn.append("`claude` not on PATH — 'cs -r' cannot resume")
+    if not shutil.which("fzf"):
+        warn.append("fzf not installed — 'cs -i' unavailable")
+
+    print()
+    for m in ok:
+        print(f"  {GREEN('ok')}    {m}")
+    for m in warn:
+        print(f"  {ORANGE('warn')}  {m}")
+    for m in bad:
+        print(f"  {MAGENTA('FAIL')}  {m}")
+    print()
+    if bad:
+        print(DIM("  Claude Code's on-disk format has probably changed."))
+        print(DIM("  See the compatibility note in the README."))
+        return 1
+    print(DIM("  Formats match what this tool expects."))
+    return 0
+
+
+def _tail_lines(f, nbytes=400_000):
+    """Last chunk of a file as lines, for cheap sampling of large transcripts."""
+    try:
+        size = f.stat().st_size
+        with f.open("rb") as fh:
+            if size > nbytes:
+                fh.seek(size - nbytes)
+                fh.readline()
+            return fh.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return []
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("query", nargs="*")
@@ -473,11 +592,15 @@ def main():
     ap.add_argument("-v", "--view")
     ap.add_argument("-r", "--resume")
     ap.add_argument("-h", "--help", action="store_true")
+    ap.add_argument("--doctor", action="store_true")
     a = ap.parse_args()
 
     if a.help:
         print(__doc__)
         return
+
+    if a.doctor:
+        return cmd_doctor()
 
     # -v / -r may reference an index from a fresh list or a search
     q = " ".join(a.query).strip()
@@ -525,7 +648,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except BrokenPipeError:
         pass
     except KeyboardInterrupt:
